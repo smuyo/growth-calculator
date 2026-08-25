@@ -86,11 +86,97 @@ OD data but no dosing events are reported and skipped.
   `start_time_h`, `end_time_h`, `duration_h`, `growth_rate_h-1`,
   `std_err_h-1`, `doubling_time_h`, `r_squared`, `p_value`,
   `intercept_ln_od`, `od_start`, `od_end`, `n_points`.
-- `output/regression_plots/<unit>_segment_<nnn>.png` — ln(OD) vs time with the
-  fitted line, annotated with µ ± SE, R², doubling time, n and duration.
+- `output/regression_plots/<unit>/<unit>_segment_<nnn>.png` — ln(OD) vs time with
+  the fitted line, annotated with µ ± SE, R², doubling time, n and duration.
+  One subfolder per reactor.
 - `output/reactor_plots/<unit>_od_timeline.png` — full OD trace per reactor.
   Blue = readings used in fits, grey = excluded, red = automated dilution
   windows, orange = manual dosing windows.
+
+## Plotting the growth rates
+
+`plot_growth_rates.py` turns `growth_rates.csv` into figures:
+
+```bash
+uv run plot_growth_rates.py                      # uses output/growth_rates.csv and groups.csv
+uv run plot_growth_rates.py --between-dilutions-only --min-r2 0.9
+uv run plot_growth_rates.py --reference-line 0.75 0.95   # mark target / expected µ
+uv run plot_growth_rates.py --omit-reactors P02          # leave a reactor out
+uv run plot_growth_rates.py --no-average-line            # hide the per-reactor average
+```
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--growth-rates` | `output/growth_rates.csv` | input CSV |
+| `--groups` | `groups.csv` | two-column CSV mapping each reactor to a group |
+| `--output-dir` | next to the input CSV | where the figures go |
+| `--stats` / `--no-stats` | on | compare the groups statistically and annotate the grouped plot |
+| `--stats-level` | `reactor` | unit of replication for the comparison: `reactor` or `segment` |
+| `--average-line` / `--no-average-line` | on | dashed line at each reactor's average growth rate |
+| `--omit-reactors` | none | reactors to leave out entirely, e.g. `--omit-reactors P02` |
+| `--reference-line` | none | draw a dashed horizontal line at one or more µ values on every plot |
+| `--min-r2` | `0.0` | drop segments whose fit is worse than this |
+| `--between-dilutions-only` | off | keep only true turbidostat cycles |
+
+Outputs:
+
+- `growth_rate_scatter/<unit>.png` — µ per segment against time, one plot per
+  reactor, points shaded by the R² of their fit, dashed line = reactor average.
+  A legend names the dashed rules on both the per-reactor plots and the
+  small-multiples figure.
+- `growth_rate_scatter/all_reactors.png` — the same panels as small multiples on
+  shared axes, one row per group (labelled with the group name and its reactor
+  count), for comparing reactors within and across groups at a glance. Reactors
+  missing from the group file get a trailing `(no group)` row.
+- `growth_rates_by_group.png` — every reactor side by side (box + individual
+  segments), ordered, shaded and labelled by group, with the pooled per-group
+  distribution beside it. Per-group mean, SD and count are also printed.
+
+### Comparing the groups
+
+With two or more groups, `compare_groups()` tests them against each other and the
+result is drawn on `growth_rates_by_group.png` as significance brackets over the
+pooled panel, with a footnote naming the test. The same numbers are printed.
+
+- **Two groups** — Welch's t-test (unequal variances).
+- **More than two** — a one-way ANOVA across all groups, plus pairwise Welch
+  tests with Holm-Bonferroni correction. Only the first three brackets are
+  drawn, or the significant ones if there are more; the full table is printed.
+- **`--stats-level reactor` (default)** — each reactor contributes one value,
+  its average growth rate. This is the honest unit of replication: segments from
+  one reactor are repeated measures of the same culture.
+- **`--stats-level segment`** — pools every segment instead. It gives far
+  smaller p-values, but they answer "do these segments differ?", not "do these
+  treatments differ?". Use it only to describe the spread, never to claim an
+  effect.
+
+With three reactors per group, the reactor-level test has very little power: a
+real effect can easily come back `ns`. Read the effect size and the per-reactor
+panel alongside the p-value.
+
+`--omit-reactors` drops the named reactors before anything is plotted, so they
+appear in neither the scatters, the grouped figure, nor the per-group summary.
+Names are matched case-insensitively and a capital `O` is accepted for a zero; a
+name that is not in the data is reported as a warning rather than failing the
+run. Note that a per-reactor PNG written by an earlier run is not deleted.
+
+`--reference-line` takes one or more growth rates and draws each as a dashed
+violet rule, labelled with its own value, on every figure — a target µ, a
+published value, or a previous run's mean. It is distinct from the orange dashed
+reactor-average line, and the y range is widened if needed so the line is visible.
+
+The group file has two columns, one row per reactor:
+
+```csv
+group,reactor
+P01,Heated
+P02,Heated
+```
+
+Which column holds the reactor is detected from the contents rather than the
+header (the shipped `groups.csv` has its headers the other way round), and a
+capital `O` typed for a zero — `PO8` — is matched to `P08`, with a note printed.
+Reactors missing from the group file are left out of the grouped plot.
 
 ## Interpreting the results
 

@@ -14,7 +14,9 @@ of the fit.
 
 Outputs (written to --output-dir):
   - growth_rates.csv          one row per growth segment
-  - regression_plots/*.png    ln(OD) vs time with fitted line, per segment
+  - regression_plots/<unit>/*.png
+                              ln(OD) vs time with fitted line, per segment,
+                              in one subfolder per pioreactor unit
   - reactor_plots/*.png       OD vs time per reactor, exclusion windows shaded
 """
 
@@ -451,6 +453,11 @@ def main():
 
         segments = build_segments(od_unit, windows, args.min_points)
 
+        # Each unit's regression plots go in their own subfolder.
+        unit_regression_dir = regression_dir / str(unit)
+        if segments:
+            unit_regression_dir.mkdir(parents=True, exist_ok=True)
+
         unit_results = []
         for seg in segments:
             fit, t, ln_od, result = fit_growth_rate(seg["data"])
@@ -464,7 +471,7 @@ def main():
             }
             unit_results.append(row)
             all_results.append(row)
-            plot_regression(unit, fit, t, ln_od, result, regression_dir)
+            plot_regression(unit, fit, t, ln_od, result, unit_regression_dir)
 
         plot_reactor_timeline(unit, od_unit, windows, unit_results, reactor_dir)
         print(
@@ -503,7 +510,7 @@ def main():
     results_df.to_csv(csv_path, index=False)
 
     print(f"\nWrote {len(results_df)} growth-rate rows -> {csv_path}")
-    print(f"Regression plots -> {regression_dir}")
+    print(f"Regression plots (one folder per unit) -> {regression_dir}")
     print(f"Reactor timeline plots -> {reactor_dir}")
 
 
