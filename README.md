@@ -28,8 +28,8 @@ figures are still written, the grouped figure and the group comparison are
 skipped.
 
 Results go to a `YYMMDD_growth_analysis/` folder (today's date) created next to
-the export folder — here `input/260826_growth_analysis/` — so each export keeps
-its own analysis and runs on different days never overwrite each other.
+the export folder so each export keeps its own analysis and runs on different 
+days never overwrite each other.
 Override with `--output-dir`.
 
 Any `--*-file` flag overrides auto-discovery for that one input, so the two can
