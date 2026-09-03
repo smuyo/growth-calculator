@@ -279,13 +279,3 @@ df = pd.read_csv("260826_growth_analysis/growth_rates.csv")
 clean = df[(df.segment_position == "between_dilutions") & (df.r_squared > 0.9)]
 print(clean.groupby("pioreactor_unit")["growth_rate_h-1"].agg(["count", "mean", "std"]))
 ```
-
-## Notes on the example dataset (`input/260720_pio_data`)
-
-- Reactors under turbidostat control: P01–P06, P08. P07, P09, P10, P11 have OD
-  data but no dosing events.
-- Many dilutions fire back-to-back (< 3 min apart) when OD stays above target;
-  those gaps hold too few readings to fit and are skipped via `--min-points`.
-- After roughly 45.5 h OD climbs well above target in several reactors despite
-  dilution commands, suggesting media exhaustion or a pump problem. Those data
-  fall inside dilution windows and are excluded.
