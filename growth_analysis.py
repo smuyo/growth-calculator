@@ -26,28 +26,34 @@ horizontal rule at a given growth rate on every plot, for comparing against a
 target or a published value.
 
 Outputs (written to --output-dir, by default ./YYMMDD_growth_analysis):
-  - growth_rates.csv                 one row per growth segment
-  - regression_plots/<unit>/*.png    ln(OD) vs time with fitted line, per
-                                     segment, one subfolder per unit
-  - reactor_plots/*.png              OD vs time per reactor, exclusion windows
-                                     shaded
-  - growth_rate_scatter/<unit>.png   growth rate vs time, one plot per reactor
-  - growth_rate_scatter/all_reactors.png
-                                     the same scatters as small multiples
-  - growth_rates_by_group.png        every reactor side by side, ordered and
-                                     coloured by group, plus the per-group
-                                     summary and the group comparison
+  - growth_rates.csv                    one row per growth segment
+  - od_calibration.csv                  the OD calibration applied (if any)
+  - segment_fit_plots/<unit>/*.png      ln(OD) vs time with the fitted line,
+                                        one plot per segment
+  - od_plots/<unit>_od_timeline.png     OD vs time per reactor, exclusion
+                                        windows shaded
+  - od_plots/all_reactors.png           the OD traces as small multiples
+  - growth_rate_plots/<unit>.png        growth rate vs time, one per reactor
+  - growth_rate_plots/all_reactors.png  the same as small multiples
+  - od_growth_rate_plots/<unit>.png     OD with the growth rates overlaid on
+                                        a second axis, one per reactor
+  - od_growth_rate_plots/all_reactors.png
+                                        the same as small multiples
+  - growth_rates_by_group.png           every reactor side by side, ordered and
+                                        coloured by group, plus the per-group
+                                        summary and the group comparison
 
 With temperature readings in the export (or --temperatures) it also writes:
-  - temperature/<unit>.png           temperature vs time, one plot per reactor
-  - temperature/all_reactors.png     the same traces as small multiples
-  - temperature_growth_rate/<unit>.png
-                                     temperature vs time with the growth rates
-                                     of that reactor overlaid on a second axis
+  - temperature_plots/<unit>.png        temperature vs time, one per reactor
+  - temperature_plots/all_reactors.png  the same as small multiples
+  - temperature_growth_rate_plots/<unit>.png
+                                        temperature with the growth rates
+                                        overlaid on a second axis
 """
 
 import argparse
 import math
+import shutil
 from datetime import date
 from pathlib import Path
 
@@ -61,6 +67,13 @@ from matplotlib.colors import LinearSegmentedColormap, Normalize
 from matplotlib.lines import Line2D
 from scipy import stats
 from scipy import stats as sstats
+
+# Every PNG is written at print resolution, so figures can go straight onto a
+# poster or slide without looking soft. The per-segment regression plots are
+# the exception: there are hundreds of them and they are for checking fits, so
+# they default to screen resolution (--high-res-regression-plots overrides).
+FIGURE_DPI = 300
+REGRESSION_DPI = 150
 
 # =============================================================================
 # Growth-rate calculation
@@ -77,8 +90,16 @@ AUTOMATION_COLUMNS = ["pioreactor_unit", "event_name", TIME_COL]
 MANUAL_COLUMNS = ["pioreactor_unit", "source_of_event", TIME_COL]
 
 
-def resolve_input_file(explicit: Path | None, data_dir: Path | None, subdir: str, flag: str) -> Path:
-    # Pick the CSV to read: an explicit --*-file wins, else the one CSV in data_dir/subdir
+def resolve_input_file(
+    explicit: Path | None,
+    data_dir: Path | None,
+    subdir: str,
+    flag: str,
+    required: list[str] | None = None,
+) -> Path:
+    # Pick the CSV to read: an explicit --*-file wins, else the one CSV in data_dir/subdir.
+    # With several CSVs there, ones lacking the `required` columns are set aside, so
+    # an unrelated file kept alongside (e.g. the OD calibration file) does no harm.
     if explicit is not None:
         if explicit.is_dir():
             raise IsADirectoryError(f"{flag} expects a CSV file, but got the directory {explicit}")
@@ -95,6 +116,10 @@ def resolve_input_file(explicit: Path | None, data_dir: Path | None, subdir: str
             f"{directory} does not exist. Pass {flag} to point directly at the CSV."
         )
     files = sorted(directory.glob("*.csv"))
+    if len(files) > 1 and required:
+        matching = [f for f in files if set(required) <= set(pd.read_csv(f, nrows=0).columns)]
+        if len(matching) == 1:
+            return matching[0]
     if not files:
         raise FileNotFoundError(
             f"No CSV file found in {directory}. Pass {flag} to point directly at the CSV."
@@ -137,6 +162,93 @@ def load_manual_dosing_events(path: Path) -> pd.DataFrame:
     df = _read_csv(path, MANUAL_COLUMNS, "Dosing events")
     manual = df[df["source_of_event"] == "UI"]
     return manual.sort_values(["pioreactor_unit", TIME_COL]).reset_index(drop=True)
+
+
+def load_calibration(path: Path) -> pd.DataFrame:
+    """Read the OD calibration file: two true OD values per reactor.
+
+    The smaller value is the true OD at the start of the run, the larger the
+    true OD at its end; their order in the file does not matter. The OD column
+    is whichever one is numeric, so the header names are not relied on.
+    """
+    raw = pd.read_csv(path)
+    if raw.shape[1] < 2:
+        raise ValueError(f"{path} needs two columns (reactor and OD).")
+    numeric = [c for c in raw.columns if pd.to_numeric(raw[c], errors="coerce").notna().all()]
+    if not numeric or len(numeric) == raw.shape[1]:
+        raise ValueError(f"{path}: cannot tell the reactor column from the OD column.")
+    od_col = numeric[0]
+    reactor_col = next(c for c in raw.columns if c not in numeric)
+
+    cal = pd.DataFrame(
+        {"key": raw[reactor_col].map(_normalise_unit), "od": pd.to_numeric(raw[od_col])}
+    )
+    counts = cal.groupby("key")["od"].count()
+    wrong = counts[counts != 2]
+    if not wrong.empty:
+        listed = ", ".join(f"{k} ({n})" for k, n in wrong.items())
+        raise ValueError(f"{path}: every reactor needs exactly 2 OD values; got {listed}.")
+    out = cal.groupby("key")["od"].agg(true_low="min", true_high="max")
+    flat = out.index[out["true_low"] == out["true_high"]]
+    if len(flat):
+        raise ValueError(f"{path}: low and high OD are equal for {', '.join(flat)}.")
+    return out
+
+
+def calibrate_od(
+    od: pd.DataFrame, calibration: pd.DataFrame, skip: int, points: int
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Linearly rescale each reactor's OD readings onto its calibration values.
+
+    The measured start OD is the median of the `points` readings after the first
+    `skip` (the first few readings of a run read high); the measured end OD is
+    the median of the last `points` readings, so a few outliers at the end do
+    not move it. Those two are mapped onto the true low and high OD.
+    """
+    od = od.copy()
+    rows, missing = [], []
+    for unit, unit_od in od.groupby("pioreactor_unit"):
+        key = _normalise_unit(unit)
+        if key not in calibration.index:
+            missing.append(unit)
+            continue
+        values = unit_od.sort_values(TIME_COL)["od_reading"].to_numpy(dtype=float)
+        if len(values) < skip + 2 * points:
+            raise ValueError(
+                f"{unit} has only {len(values)} OD readings, too few to calibrate with "
+                f"--calibration-skip {skip} and --calibration-points {points}."
+            )
+        measured_low = float(np.median(values[skip : skip + points]))
+        measured_high = float(np.median(values[-points:]))
+        true_low, true_high = calibration.loc[key, ["true_low", "true_high"]]
+        if measured_high <= measured_low:
+            raise ValueError(
+                f"{unit}: the measured end OD ({measured_high:.4g}) is not above the "
+                f"measured start OD ({measured_low:.4g}), so it cannot be calibrated."
+            )
+        slope = (true_high - true_low) / (measured_high - measured_low)
+        intercept = true_low - slope * measured_low
+        od.loc[unit_od.index, "od_reading"] = slope * unit_od["od_reading"] + intercept
+        rows.append(
+            {
+                "pioreactor_unit": unit,
+                "measured_low": measured_low,
+                "measured_high": measured_high,
+                "true_low": true_low,
+                "true_high": true_high,
+                "slope": slope,
+                "intercept": intercept,
+            }
+        )
+    if missing:
+        raise ValueError(
+            f"no calibration values for {', '.join(missing)}. Add them to the calibration "
+            "file, or leave those reactors out with --exclude-reactors."
+        )
+    unused = sorted(set(calibration.index) - {_normalise_unit(r["pioreactor_unit"]) for r in rows})
+    if unused:
+        print(f"NOTE: calibration file reactors with no OD readings: {', '.join(unused)}")
+    return od, pd.DataFrame(rows)
 
 
 def automation_dilution_windows(events: pd.DataFrame, unit: str) -> list[dict]:
@@ -263,7 +375,7 @@ def fit_growth_rate(seg_data: pd.DataFrame):
     return fit, t, ln_od, result
 
 
-def plot_regression(unit, fit, t, ln_od, result, out_dir: Path):
+def plot_regression(unit, fit, t, ln_od, result, out_dir: Path, dpi: int = REGRESSION_DPI):
     fig, ax = plt.subplots(figsize=(6.5, 4.5))
     ax.scatter(t, ln_od, s=18, color="#1f77b4", label="ln(OD)", zorder=3)
     t_fit = np.array([t.min(), t.max()])
@@ -300,7 +412,7 @@ def plot_regression(unit, fit, t, ln_od, result, out_dir: Path):
     ax.legend(loc="lower right", fontsize=9)
     ax.grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig(out_dir / f"{unit}_segment_{fit['segment_index']:03d}.png", dpi=150)
+    fig.savefig(out_dir / f"{unit}_segment_{fit['segment_index']:03d}.png", dpi=dpi)
     plt.close(fig)
 
 
@@ -355,7 +467,7 @@ def plot_reactor_timeline(unit, od_unit, windows, unit_results, out_dir: Path):
     ax.legend(loc="upper left", fontsize=9)
     ax.grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig(out_dir / f"{unit}_od_timeline.png", dpi=150)
+    fig.savefig(out_dir / f"{unit}_od_timeline.png", dpi=FIGURE_DPI)
     plt.close(fig)
 
 
@@ -424,6 +536,20 @@ def load_growth_rates(path: Path) -> pd.DataFrame:
 def _normalise_unit(name: str) -> str:
     # Reactor ids are letter+digits; a typed capital O for a zero is a common slip.
     return str(name).strip().upper().replace("O", "0")
+
+
+def drop_excluded(df: pd.DataFrame, excluded: list[str], found: set[str]) -> pd.DataFrame:
+    """Remove the --exclude-reactors units from one input table.
+
+    Every excluded name this table actually held is added to `found`, so names
+    matching none of the inputs can be reported once at the end.
+    """
+    if not excluded:
+        return df
+    keys = df[UNIT_COL].map(_normalise_unit)
+    hit = keys.isin({_normalise_unit(u) for u in excluded})
+    found.update(keys[hit])
+    return df[~hit]
 
 
 def load_groups(path: Path, units: list[str], omitted: set[str] | None = None) -> pd.DataFrame:
@@ -577,7 +703,7 @@ def plot_per_reactor(df: pd.DataFrame, out_dir: Path, norm, references=None, sho
                 labelcolor=TEXT_SECONDARY,
             )
         fig.tight_layout()
-        fig.savefig(out_dir / f"{unit}.png", dpi=150, facecolor=SURFACE)
+        fig.savefig(out_dir / f"{unit}.png", dpi=FIGURE_DPI, facecolor=SURFACE)
         plt.close(fig)
 
 
@@ -604,7 +730,7 @@ def _grid_layout(units: list[str], groups: pd.DataFrame | None):
     return rows, labels
 
 
-def _multiples_figure(units: list[str], groups: pd.DataFrame | None):
+def _multiples_figure(units: list[str], groups: pd.DataFrame | None, panel_width: float = 4.6):
     """Blank small-multiples grid: one panel per reactor, one row per group."""
     rows, row_labels = _grid_layout(units, groups)
     nrows = len(rows)
@@ -612,7 +738,7 @@ def _multiples_figure(units: list[str], groups: pd.DataFrame | None):
     fig, axes = plt.subplots(
         nrows,
         ncols,
-        figsize=(4.6 * ncols, 3.6 * nrows),
+        figsize=(panel_width * ncols, 3.6 * nrows),
         sharex=True,
         sharey=True,
         squeeze=False,
@@ -621,8 +747,8 @@ def _multiples_figure(units: list[str], groups: pd.DataFrame | None):
     return fig, axes, rows, row_labels
 
 
-def _label_multiples(fig, axes, rows, row_labels, xlabel: str, ylabel: str, suptitle: str) -> None:
-    """Row headings, axis labels and title for a grid from _multiples_figure()."""
+def _label_multiples(fig, axes, rows, row_labels, xlabel: str, ylabel: str) -> None:
+    """Row headings and axis labels for a grid from _multiples_figure()."""
     styles = group_styles(row_labels) if row_labels else {}
     if row_labels:
         for r, row_units in enumerate(rows):
@@ -648,13 +774,39 @@ def _label_multiples(fig, axes, rows, row_labels, xlabel: str, ylabel: str, supt
     for row in axes:
         row[0].set_ylabel(ylabel, color=TEXT_SECONDARY, fontsize=9)
 
-    fig.suptitle(suptitle, color=TEXT_PRIMARY, fontsize=13, x=0.01, y=0.99, ha="left")
     # Row headings sit above each row's panels, so the rows need room between them.
     fig.subplots_adjust(
         top=0.90 - 0.02 * nrows if row_labels else 0.93,
         hspace=0.42 if row_labels else 0.22,
         wspace=0.16,
     )
+
+
+def _multiples_header(fig, axes, title: str, handles: list, row_labels) -> None:
+    """Title and legend in one band just above the grid, spanning only the panels.
+
+    Both are pinned to the panels' outer edges rather than the figure's, so the
+    tight bounding box at save time trims the side margins away. Call this last,
+    after any colorbar has shifted the panels.
+    """
+    visible = [ax for row in axes for ax in row if ax.get_visible()]
+    left = min(ax.get_position().x0 for ax in visible)
+    right = max(ax.get_position().x1 for ax in visible)
+    top = max(ax.get_position().y1 for ax in visible)
+    # Clear the row heading and panel title above the first row (inches -> figure fraction).
+    y = top + (0.75 if row_labels else 0.45) / fig.get_figheight()
+    fig.text(left, y, title, color=TEXT_PRIMARY, fontsize=13, ha="left", va="bottom")
+    if handles:
+        fig.legend(
+            handles=handles,
+            loc="lower right",
+            bbox_to_anchor=(right, y),
+            ncol=len(handles),
+            fontsize=9,
+            frameon=False,
+            labelcolor=TEXT_SECONDARY,
+            borderaxespad=0,
+        )
 
 
 def _r2_colorbar(fig, ax_or_axes, sc, **kwargs):
@@ -687,22 +839,84 @@ def plot_small_multiples(df, out_path: Path, norm, references=None, groups=None,
         row_labels,
         "Time (h)",
         "$\\mu$ (h$^{-1}$)",
-        "Growth rate per segment over time, by reactor" + (", grouped" if row_labels else ""),
     )
     if sc is not None:
         _r2_colorbar(fig, axes, sc, pad=0.015, fraction=0.02)
     # The panels carry no legend of their own, so name the dashed rules here.
-    legend_handles = rule_handles(references, show_average)
-    if legend_handles:
-        fig.legend(
-            handles=legend_handles,
-            loc="upper right",
-            bbox_to_anchor=(0.995, 0.995),
-            fontsize=9,
-            frameon=False,
-            labelcolor=TEXT_SECONDARY,
-        )
-    fig.savefig(out_path, dpi=150, facecolor=SURFACE, bbox_inches="tight")
+    _multiples_header(
+        fig,
+        axes,
+        "Growth rate per segment over time, by reactor" + (", grouped" if row_labels else ""),
+        rule_handles(references, show_average),
+        row_labels,
+    )
+    fig.savefig(out_path, dpi=FIGURE_DPI, facecolor=SURFACE, bbox_inches="tight")
+    plt.close(fig)
+
+
+# --- OD ----------------------------------------------------------------------
+OD_USED_COLOR = "#2a78d6"
+OD_EXCLUDED_COLOR = "#c9c8c3"
+
+
+def plot_od_small_multiples(
+    od_trace: pd.DataFrame, out_path: Path, groups=None, calibrated: bool = False
+) -> None:
+    """OD against time for every reactor, laid out like the growth-rate grid.
+
+    `od_trace` has one row per OD reading and a boolean `used` column: readings
+    inside a fitted segment are drawn in blue, the rest (dilutions, manual
+    dosing, unfitted stretches) in grey underneath.
+    """
+    units = sorted(od_trace[UNIT_COL].unique())
+    # Wider panels than the other grids: a run's many dilution cycles need room.
+    fig, axes, rows, row_labels = _multiples_figure(units, groups, panel_width=7.0)
+
+    for r, row_units in enumerate(rows):
+        for c in range(len(axes[r])):
+            ax = axes[r][c]
+            if c >= len(row_units):
+                ax.set_visible(False)
+                continue
+            unit = row_units[c]
+            unit_od = od_trace[od_trace[UNIT_COL] == unit]
+            style_axes(ax)
+            ax.plot(
+                unit_od[TIME_COL],
+                unit_od["od_reading"],
+                color=OD_EXCLUDED_COLOR,
+                linewidth=0.9,
+                zorder=2,
+            )
+            # Masking the unused readings breaks the line at every dilution.
+            ax.plot(
+                unit_od[TIME_COL],
+                unit_od["od_reading"].where(unit_od["used"]),
+                color=OD_USED_COLOR,
+                linewidth=1.3,
+                zorder=3,
+            )
+            ax.set_title(unit, color=TEXT_PRIMARY, fontsize=11, loc="left")
+
+    _label_multiples(
+        fig,
+        axes,
+        rows,
+        row_labels,
+        "Time (h)",
+        "OD (calibrated)" if calibrated else "OD reading",
+    )
+    _multiples_header(
+        fig,
+        axes,
+        "OD over time, by reactor" + (", grouped" if row_labels else ""),
+        [
+            Line2D([], [], color=OD_USED_COLOR, linewidth=1.8, label="used for fits"),
+            Line2D([], [], color=OD_EXCLUDED_COLOR, linewidth=1.8, label="excluded"),
+        ],
+        row_labels,
+    )
+    fig.savefig(out_path, dpi=FIGURE_DPI, facecolor=SURFACE, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -771,7 +985,7 @@ def plot_temperature_per_reactor(temps: pd.DataFrame, out_dir: Path, show_averag
             labelcolor=TEXT_SECONDARY,
         )
         fig.tight_layout()
-        fig.savefig(out_dir / f"{unit}.png", dpi=150, facecolor=SURFACE)
+        fig.savefig(out_dir / f"{unit}.png", dpi=FIGURE_DPI, facecolor=SURFACE)
         plt.close(fig)
 
 
@@ -798,18 +1012,60 @@ def plot_temperature_small_multiples(
         row_labels,
         "Time (h)",
         "Temperature (\u00b0C)",
+    )
+    _multiples_header(
+        fig,
+        axes,
         "Temperature over time, by reactor" + (", grouped" if row_labels else ""),
+        temperature_legend_handles(show_average),
+        row_labels,
     )
-    fig.legend(
-        handles=temperature_legend_handles(show_average),
-        loc="upper right",
-        bbox_to_anchor=(0.995, 0.995),
-        fontsize=9,
-        frameon=False,
-        labelcolor=TEXT_SECONDARY,
-    )
-    fig.savefig(out_path, dpi=150, facecolor=SURFACE, bbox_inches="tight")
+    fig.savefig(out_path, dpi=FIGURE_DPI, facecolor=SURFACE, bbox_inches="tight")
     plt.close(fig)
+
+
+def _rate_twin_axis(ax, unit_rates: pd.DataFrame, norm, references=None, show_average=False):
+    """Right-hand axis on `ax` with one reactor's growth rates, shaded by R^2.
+
+    Returns the new axis and the scatter (for the colorbar).
+    """
+    ax2 = ax.twinx()
+    ax2.set_facecolor("none")
+    for side in ("top", "left"):
+        ax2.spines[side].set_visible(False)
+    ax2.spines["right"].set_color(GRID)
+    ax2.spines["bottom"].set_color(GRID)
+    ax2.tick_params(colors=TEXT_SECONDARY, labelsize=9, length=3, color=GRID)
+    sc = ax2.scatter(
+        unit_rates["time_h"],
+        unit_rates[RATE_COL],
+        c=unit_rates["r_squared"],
+        cmap=R2_CMAP,
+        norm=norm,
+        s=46,
+        linewidths=1.2,
+        edgecolors=SURFACE,
+        zorder=4,
+    )
+    if show_average:
+        ax2.axhline(
+            unit_rates[RATE_COL].mean(), color="#eb6834", linewidth=2, linestyle="--", zorder=3
+        )
+    add_reference_lines(ax2, references)
+    ax2.set_ylabel("Growth rate $\\mu$ (h$^{-1}$)", color=TEXT_SECONDARY, fontsize=10)
+    return ax2, sc
+
+
+def _growth_rate_handle() -> Line2D:
+    return Line2D(
+        [],
+        [],
+        color=R2_CMAP(0.9),
+        marker="o",
+        linestyle="none",
+        markersize=6,
+        label="growth rate (right)",
+    )
 
 
 def plot_temperature_with_rates(
@@ -838,26 +1094,7 @@ def plot_temperature_with_rates(
         ax.set_ylabel("Temperature (\u00b0C)", color=TEMP_COLOR, fontsize=10)
         ax.tick_params(axis="y", colors=TEMP_COLOR)
 
-        ax2 = ax.twinx()
-        ax2.set_facecolor("none")
-        for side in ("top", "left"):
-            ax2.spines[side].set_visible(False)
-        ax2.spines["right"].set_color(GRID)
-        ax2.spines["bottom"].set_color(GRID)
-        ax2.tick_params(colors=TEXT_SECONDARY, labelsize=9, length=3, color=GRID)
-        sc = ax2.scatter(
-            unit_rates["time_h"],
-            unit_rates[RATE_COL],
-            c=unit_rates["r_squared"],
-            cmap=R2_CMAP,
-            norm=norm,
-            s=46,
-            linewidths=1.2,
-            edgecolors=SURFACE,
-            zorder=4,
-        )
-        add_reference_lines(ax2, references)
-        ax2.set_ylabel("Growth rate $\\mu$ (h$^{-1}$)", color=TEXT_SECONDARY, fontsize=10)
+        ax2, sc = _rate_twin_axis(ax, unit_rates, norm, references)
 
         mean_mu = unit_rates[RATE_COL].mean()
         ax.set_title(
@@ -870,15 +1107,7 @@ def plot_temperature_with_rates(
         _r2_colorbar(fig, ax2, sc, pad=0.12)
         handles = [
             Line2D([], [], color=TEMP_COLOR, linewidth=1.8, label="temperature (left)"),
-            Line2D(
-                [],
-                [],
-                color=R2_CMAP(0.9),
-                marker="o",
-                linestyle="none",
-                markersize=6,
-                label="growth rate (right)",
-            ),
+            _growth_rate_handle(),
         ]
         if show_average:
             handles.append(
@@ -892,10 +1121,176 @@ def plot_temperature_with_rates(
             handles=handles, loc="best", fontsize=9, frameon=False, labelcolor=TEXT_SECONDARY
         )
         fig.tight_layout()
-        fig.savefig(out_dir / f"{unit}.png", dpi=150, facecolor=SURFACE)
+        fig.savefig(out_dir / f"{unit}.png", dpi=FIGURE_DPI, facecolor=SURFACE)
         plt.close(fig)
         plotted.append(unit)
     return plotted
+
+
+OD_TRACE_COLOR = "#52514e"  # neutral, so it never competes with the blue R^2 ramp
+
+
+def plot_od_with_rates(
+    od_trace: pd.DataFrame,
+    rates: pd.DataFrame,
+    out_dir: Path,
+    norm,
+    references=None,
+    show_average=True,
+    calibrated: bool = False,
+) -> list[str]:
+    """One plot per reactor: the OD trace as a line, growth rates as points.
+
+    Laid out like plot_temperature_with_rates(): OD on the left axis, µ on
+    the right. Readings used in fits are drawn dark, the rest light grey.
+    Returns the reactors plotted.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    od_label = "OD (calibrated)" if calibrated else "OD reading"
+    plotted = []
+    for unit in sorted(set(od_trace[UNIT_COL]) & set(rates[UNIT_COL])):
+        unit_od = od_trace[od_trace[UNIT_COL] == unit]
+        unit_rates = rates[rates[UNIT_COL] == unit]
+        fig, ax = plt.subplots(figsize=(9.6, 4.8), facecolor=SURFACE)
+        style_axes(ax)
+        ax.plot(
+            unit_od[TIME_COL],
+            unit_od["od_reading"],
+            color=OD_EXCLUDED_COLOR,
+            linewidth=0.9,
+            zorder=2,
+        )
+        # Masking the unused readings breaks the line at every dilution.
+        ax.plot(
+            unit_od[TIME_COL],
+            unit_od["od_reading"].where(unit_od["used"]),
+            color=OD_TRACE_COLOR,
+            linewidth=1.1,
+            zorder=3,
+        )
+        ax.set_xlabel("Time since experiment start (h)", color=TEXT_SECONDARY, fontsize=10)
+        ax.set_ylabel(od_label, color=OD_TRACE_COLOR, fontsize=10)
+
+        ax2, sc = _rate_twin_axis(ax, unit_rates, norm, references, show_average)
+        mean_mu = unit_rates[RATE_COL].mean()
+        ax.set_title(
+            f"{unit} — OD and growth rate over time\n"
+            f"average {mean_mu:.3f} h$^{{-1}}$ over {len(unit_rates)} segments",
+            color=TEXT_PRIMARY,
+            fontsize=11,
+            loc="left",
+        )
+        _r2_colorbar(fig, ax2, sc, pad=0.12)
+        handles = [
+            Line2D([], [], color=OD_TRACE_COLOR, linewidth=1.8, label="OD used for fits (left)"),
+            Line2D([], [], color=OD_EXCLUDED_COLOR, linewidth=1.8, label="OD excluded (left)"),
+            _growth_rate_handle(),
+        ]
+        handles.extend(rule_handles(references, show_average))
+        ax.legend(
+            handles=handles, loc="best", fontsize=9, frameon=False, labelcolor=TEXT_SECONDARY
+        )
+        fig.tight_layout()
+        fig.savefig(out_dir / f"{unit}.png", dpi=FIGURE_DPI, facecolor=SURFACE)
+        plt.close(fig)
+        plotted.append(unit)
+    return plotted
+
+
+def plot_od_rates_small_multiples(
+    od_trace: pd.DataFrame,
+    rates: pd.DataFrame,
+    out_path: Path,
+    norm,
+    groups=None,
+    references=None,
+    show_average=True,
+    calibrated: bool = False,
+) -> None:
+    """The plot_od_with_rates() panels as one grid, laid out like the other grids.
+
+    Both y axes are shared across panels: OD on the left via the grid itself,
+    growth rate on the right by sharing every twin axis with the first one.
+    """
+    units = sorted(set(od_trace[UNIT_COL]) & set(rates[UNIT_COL]))
+    fig, axes, rows, row_labels = _multiples_figure(units, groups, panel_width=7.0)
+
+    sc = None
+    first_twin = None
+    for r, row_units in enumerate(rows):
+        for c in range(len(axes[r])):
+            ax = axes[r][c]
+            if c >= len(row_units):
+                ax.set_visible(False)
+                continue
+            unit = row_units[c]
+            unit_od = od_trace[od_trace[UNIT_COL] == unit]
+            style_axes(ax)
+            ax.plot(
+                unit_od[TIME_COL],
+                unit_od["od_reading"],
+                color=OD_EXCLUDED_COLOR,
+                linewidth=0.9,
+                zorder=2,
+            )
+            ax.plot(
+                unit_od[TIME_COL],
+                unit_od["od_reading"].where(unit_od["used"]),
+                color=OD_TRACE_COLOR,
+                linewidth=1.1,
+                zorder=3,
+            )
+            ax.set_title(unit, color=TEXT_PRIMARY, fontsize=11, loc="left")
+
+            ax2, sc = _rate_twin_axis(
+                ax, rates[rates[UNIT_COL] == unit], norm, references, show_average
+            )
+            if first_twin is None:
+                first_twin = ax2
+            else:
+                ax2.sharey(first_twin)
+            # Growth-rate ticks and label only on the last panel of each row.
+            if c != len(row_units) - 1:
+                ax2.tick_params(labelright=False)
+                ax2.set_ylabel("")
+            else:
+                ax2.set_ylabel("$\\mu$ (h$^{-1}$)", color=TEXT_SECONDARY, fontsize=9)
+
+    if first_twin is not None:
+        # Shared autoscaling leaves the extreme points touching the frame, so set
+        # the range explicitly, with room for the points and any reference line.
+        values = np.concatenate(
+            [rates.loc[rates[UNIT_COL].isin(units), RATE_COL], references or []]
+        )
+        lo, hi = float(values.min()), float(values.max())
+        pad = 0.08 * (hi - lo or 1.0)
+        first_twin.set_ylim(lo - pad, hi + pad)
+
+    _label_multiples(
+        fig,
+        axes,
+        rows,
+        row_labels,
+        "Time (h)",
+        "OD (calibrated)" if calibrated else "OD reading",
+    )
+    if sc is not None:
+        # Wider pad than the other grids: the right-hand mu axis sits in between.
+        _r2_colorbar(fig, axes, sc, pad=0.07, fraction=0.02)
+    _multiples_header(
+        fig,
+        axes,
+        "OD and growth rate over time, by reactor" + (", grouped" if row_labels else ""),
+        [
+            Line2D([], [], color=OD_TRACE_COLOR, linewidth=1.8, label="OD used for fits (left)"),
+            Line2D([], [], color=OD_EXCLUDED_COLOR, linewidth=1.8, label="OD excluded (left)"),
+            _growth_rate_handle(),
+            *rule_handles(references, show_average),
+        ],
+        row_labels,
+    )
+    fig.savefig(out_path, dpi=FIGURE_DPI, facecolor=SURFACE, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _box(ax, values_by_x: list[np.ndarray], positions, colors, width=0.62):
@@ -1209,7 +1604,7 @@ def plot_by_group(
         note += " · ns p≥0.05, * <0.05, ** <0.01, *** <0.001"
         fig.text(0.01, 0.005, note, fontsize=8, color=TEXT_MUTED, ha="left", va="bottom")
     fig.tight_layout(rect=(0, 0.03, 1, 1) if comparison else None)
-    fig.savefig(out_path, dpi=150, facecolor=SURFACE)
+    fig.savefig(out_path, dpi=FIGURE_DPI, facecolor=SURFACE)
     plt.close(fig)
 
     summary = (
@@ -1287,6 +1682,37 @@ def find_groups_file(data_dir: Path | None, root: Path | None) -> Path | None:
     return None
 
 
+def find_calibration_file(data_dir: Path | None, root: Path | None) -> Path | None:
+    """Look for an OD calibration file: a CSV with "calibration" in its name.
+
+    Searched in od_readings/, the export folder, the folder holding it and the
+    working directory, in that order; the first folder with one wins. Two in the
+    same folder is ambiguous, so that is an error rather than a guess.
+    """
+    candidates = []
+    bases = (
+        data_dir / "od_readings" if data_dir else None,
+        data_dir,
+        data_dir.parent if data_dir else None,
+        root,
+        Path.cwd(),
+    )
+    for base in bases:
+        if base is not None and base.is_dir() and base.resolve() not in candidates:
+            candidates.append(base.resolve())
+    for base in candidates:
+        found = sorted(f for f in base.glob("*.csv") if "calibration" in f.name.lower())
+        if len(found) > 1:
+            names = "\n  ".join(str(f) for f in found)
+            raise ValueError(
+                f"{len(found)} calibration files found, so the choice is ambiguous. "
+                f"Pass --calibration to choose one (or --no-calibration):\n  {names}"
+            )
+        if found:
+            return found[0]
+    return None
+
+
 def default_output_dir(data_dir: Path | None) -> Path:
     """Today's results folder, placed beside the export folder it came from.
 
@@ -1297,15 +1723,29 @@ def default_output_dir(data_dir: Path | None) -> Path:
     return base / f"{date.today():%y%m%d}_growth_analysis"
 
 
-def calculate_growth_rates(args, parser, data_dir: Path | None, out_dir: Path) -> pd.DataFrame:
-    """Fit every growth segment, write growth_rates.csv and the fit plots."""
+def calculate_growth_rates(
+    args, parser, data_dir: Path | None, out_dir: Path, excluded_found: set[str]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fit every growth segment, write growth_rates.csv and the fit plots.
+
+    Returns the fitted segments and the OD trace they were fitted on (one row
+    per reading, with a boolean `used` column marking readings inside a fit).
+    """
     try:
-        od_path = resolve_input_file(args.od_file, data_dir, "od_readings", "--od-file")
+        calibration = None
+        if args.calibration is not None:
+            if not args.calibration.is_file():
+                raise FileNotFoundError(f"--calibration: no such file: {args.calibration}")
+            calibration = load_calibration(args.calibration)
+        od_path = resolve_input_file(
+            args.od_file, data_dir, "od_readings", "--od-file", OD_COLUMNS
+        )
         events_path = resolve_input_file(
             args.dosing_automation_file,
             data_dir,
             "dosing_automation_events",
             "--dosing-automation-file",
+            AUTOMATION_COLUMNS,
         )
         od = load_od_readings(od_path)
         events = load_dosing_automation_events(events_path)
@@ -1319,7 +1759,11 @@ def calculate_growth_rates(args, parser, data_dir: Path | None, out_dir: Path) -
     if not args.ignore_manual_dosing:
         try:
             manual_path = resolve_input_file(
-                args.dosing_events_file, data_dir, "dosing_events", "--dosing-events-file"
+                args.dosing_events_file,
+                data_dir,
+                "dosing_events",
+                "--dosing-events-file",
+                MANUAL_COLUMNS,
             )
             manual = load_manual_dosing_events(manual_path)
         except (FileNotFoundError, IsADirectoryError, ValueError) as exc:
@@ -1333,10 +1777,39 @@ def calculate_growth_rates(args, parser, data_dir: Path | None, out_dir: Path) -
             print(f"Dosing events (manual):   {manual_path}  ({len(manual)} UI rows)")
     print()
 
-    regression_dir = out_dir / "regression_plots"
-    reactor_dir = out_dir / "reactor_plots"
+    # Excluded reactors are dropped before anything is fitted, so they get no
+    # rows in growth_rates.csv and no regression or timeline plots.
+    od = drop_excluded(od, args.exclude_reactors, excluded_found)
+    events = drop_excluded(events, args.exclude_reactors, excluded_found)
+    if manual is not None:
+        manual = drop_excluded(manual, args.exclude_reactors, excluded_found)
+
+    calibration_table = None
+    if calibration is not None:
+        # Excluded reactors need no calibration, and are not worth a note either.
+        dropped = {_normalise_unit(u) for u in args.exclude_reactors}
+        calibration = calibration[~calibration.index.isin(dropped)]
+        try:
+            od, calibration_table = calibrate_od(
+                od, calibration, args.calibration_skip, args.calibration_points
+            )
+        except ValueError as exc:
+            parser.exit(2, f"error: calibration file {args.calibration}: {exc}\n")
+        print(f"OD calibrated with {args.calibration}:")
+        for _, row in calibration_table.iterrows():
+            print(
+                f"  {row['pioreactor_unit']}: measured {row['measured_low']:.3f} -> "
+                f"{row['true_low']:.3f}, {row['measured_high']:.3f} -> {row['true_high']:.3f}"
+                f"  (OD = {row['slope']:.3f} x reading {row['intercept']:+.3f})"
+            )
+        print()
+
+    regression_dir = out_dir / "segment_fit_plots"
+    reactor_dir = out_dir / "od_plots"
     regression_dir.mkdir(parents=True, exist_ok=True)
     reactor_dir.mkdir(parents=True, exist_ok=True)
+    if calibration_table is not None:
+        calibration_table.to_csv(out_dir / "od_calibration.csv", index=False)
 
     n_before = len(od)
     od = od[od["od_reading"] > max(args.min_od, 0.0)]
@@ -1345,6 +1818,8 @@ def calculate_growth_rates(args, parser, data_dir: Path | None, out_dir: Path) -
 
     units = sorted(events["pioreactor_unit"].unique())
     all_results = []
+    traces = []
+    regression_dpi = FIGURE_DPI if args.high_res_regression_plots else REGRESSION_DPI
 
     for unit in units:
         od_unit = od[od["pioreactor_unit"] == unit].sort_values(TIME_COL)
@@ -1381,9 +1856,17 @@ def calculate_growth_rates(args, parser, data_dir: Path | None, out_dir: Path) -
             }
             unit_results.append(row)
             all_results.append(row)
-            plot_regression(unit, fit, t, ln_od, result, unit_regression_dir)
+            plot_regression(unit, fit, t, ln_od, result, unit_regression_dir, regression_dpi)
 
-        plot_reactor_timeline(unit, od_unit, windows, unit_results, reactor_dir)
+        # The first readings of a run often spike and squash the rest of the
+        # trace, so they can be left out of the OD figures; the fits keep them.
+        shown = od_unit.iloc[args.hide_first_readings :]
+        plot_reactor_timeline(unit, shown, windows, unit_results, reactor_dir)
+        t = shown[TIME_COL]
+        used = np.zeros(len(shown), dtype=bool)
+        for row in unit_results:
+            used |= ((t >= row["start_time_h"]) & (t <= row["end_time_h"])).to_numpy()
+        traces.append(shown[[UNIT_COL, TIME_COL, "od_reading"]].assign(used=used))
         print(
             f"{unit}: {len(unit_results)} segments fitted | "
             f"{n_auto} automated dilutions, {n_manual} manual bursts "
@@ -1423,9 +1906,9 @@ def calculate_growth_rates(args, parser, data_dir: Path | None, out_dir: Path) -
     results_df.to_csv(csv_path, index=False)
 
     print(f"\nWrote {len(results_df)} growth-rate rows -> {csv_path}")
-    print(f"Regression plots (one folder per unit) -> {regression_dir}")
-    print(f"Reactor timeline plots -> {reactor_dir}")
-    return results_df
+    print(f"Segment fit plots (one folder per unit) -> {regression_dir}")
+    print(f"OD timeline plots -> {reactor_dir}")
+    return results_df, pd.concat(traces, ignore_index=True)
 
 
 def plot_growth_rates(
@@ -1435,6 +1918,7 @@ def plot_growth_rates(
     temps: pd.DataFrame | None,
     out_dir: Path,
     groups_path: Path | None,
+    od_trace: pd.DataFrame | None = None,
 ):
     """Draw every growth-rate figure from the fitted segments."""
     omitted = set()
@@ -1455,6 +1939,8 @@ def plot_growth_rates(
             print(f"Omitted {', '.join(sorted(omitted))} ({n - len(df)} segments)")
             if temps is not None:
                 temps = temps[~temps[UNIT_COL].isin(omitted)]
+            if od_trace is not None:
+                od_trace = od_trace[~od_trace[UNIT_COL].isin(omitted)]
 
     if args.between_dilutions_only:
         n = len(df)
@@ -1470,7 +1956,7 @@ def plot_growth_rates(
     out_dir.mkdir(parents=True, exist_ok=True)
     norm = Normalize(vmin=max(0.0, df["r_squared"].min()), vmax=1.0)
 
-    scatter_dir = out_dir / "growth_rate_scatter"
+    scatter_dir = out_dir / "growth_rate_plots"
     references = args.reference_line
     groups = None
     if groups_path is not None:
@@ -1480,7 +1966,9 @@ def plot_growth_rates(
             known_units = set(df[UNIT_COL].unique())
             if temps is not None:
                 known_units |= set(temps[UNIT_COL].unique())
-            groups = load_groups(groups_path, sorted(known_units), omitted)
+            groups = load_groups(
+                groups_path, sorted(known_units), omitted | set(args.exclude_reactors)
+            )
         except (FileNotFoundError, ValueError) as exc:
             parser.exit(2, f"error: {exc}\n")
 
@@ -1488,20 +1976,48 @@ def plot_growth_rates(
     plot_small_multiples(
         df, scatter_dir / "all_reactors.png", norm, references, groups, args.average_line
     )
-    print(f"Per-reactor scatter plots -> {scatter_dir}")
+    print(f"Growth rate plots -> {scatter_dir}")
+
+    if od_trace is not None and not od_trace.empty:
+        od_grid_path = out_dir / "od_plots" / "all_reactors.png"
+        od_grid_path.parent.mkdir(parents=True, exist_ok=True)
+        plot_od_small_multiples(od_trace, od_grid_path, groups, args.calibration is not None)
+        print(f"OD grid -> {od_grid_path}")
+
+        od_rate_dir = out_dir / "od_growth_rate_plots"
+        if plot_od_with_rates(
+            od_trace,
+            df,
+            od_rate_dir,
+            norm,
+            references,
+            args.average_line,
+            args.calibration is not None,
+        ):
+            plot_od_rates_small_multiples(
+                od_trace,
+                df,
+                od_rate_dir / "all_reactors.png",
+                norm,
+                groups,
+                references,
+                args.average_line,
+                args.calibration is not None,
+            )
+            print(f"OD + growth rate plots -> {od_rate_dir}")
 
     if temps is not None:
         if temps.empty:
             parser.exit(2, "error: no temperature readings left to plot.\n")
 
-        temp_dir = out_dir / "temperature"
+        temp_dir = out_dir / "temperature_plots"
         plot_temperature_per_reactor(temps, temp_dir, args.average_line)
         plot_temperature_small_multiples(
             temps, temp_dir / "all_reactors.png", groups, args.average_line
         )
         print(f"Temperature plots -> {temp_dir}")
 
-        combined_dir = out_dir / "temperature_growth_rate"
+        combined_dir = out_dir / "temperature_growth_rate_plots"
         plotted = plot_temperature_with_rates(
             temps, df, combined_dir, norm, references, args.average_line
         )
@@ -1540,159 +2056,237 @@ def plot_growth_rates(
     print(f"\nGrouped plot -> {group_path}")
 
 
+HELP_DESCRIPTION = """\
+Fit a growth rate (mu, h^-1) to every growth period between dilutions in a
+Pioreactor turbidostat export, then write growth_rates.csv and every figure.
+Full documentation: README.md"""
+
+HELP_EPILOG = """\
+examples:
+  growth_analysis.py input/260720_pio_data --groups input/groups.csv
+  growth_analysis.py input --exclude-reactors P02        ignore a reactor completely
+  growth_analysis.py input --between-dilutions-only --min-r2 0.9
+  growth_analysis.py input --growth-rates 260826_growth_analysis/growth_rates.csv"""
+
+
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    # A wider option column keeps each flag's help on one line, without
+    # overflowing a narrow terminal.
+    def __init__(self, prog):
+        width = min(100, shutil.get_terminal_size().columns - 2)
+        super().__init__(prog, max_help_position=34, width=width)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+        usage="%(prog)s [DATA_DIR] [options]",
+        description=HELP_DESCRIPTION,
+        epilog=HELP_EPILOG,
+        formatter_class=_HelpFormatter,
     )
 
-    inputs = parser.add_argument_group("inputs")
-    inputs.add_argument(
+    io = parser.add_argument_group("input and output")
+    io.add_argument(
         "data_dir_positional",
         type=str,
         nargs="?",
         metavar="DATA_DIR",
-        help="Same as --data-dir, given positionally.",
+        help="export folder, same as --data-dir (default: current folder)",
     )
-    inputs.add_argument(
+    io.add_argument(
         "--data-dir",
         type=str,
         default=None,
-        help="Pioreactor export folder holding od_readings/, dosing_automation_events/, "
-        "dosing_events/ and temperature_readings/ (see input/260720_pio_data). Each "
-        "input CSV is auto-discovered inside it unless the matching --*-file flag is "
-        "given. A folder that merely holds one such export works too. Pass "
-        "--data-dir '' to disable auto-discovery and require explicit files. "
-        "(default: the current working directory)",
+        metavar="DIR",
+        help="export folder to auto-discover the CSVs in; '' turns discovery off",
     )
-    inputs.add_argument(
+    io.add_argument(
         "--groups",
         type=Path,
         default=None,
-        help="CSV mapping each reactor to a group (two columns: reactor, group), "
-        f"e.g. --groups input/groups.csv. Without it a {GROUPS_FILENAME} beside the "
-        "data is used; with no group file at all the grouped figure and the group "
-        "comparison are skipped.",
+        metavar="CSV",
+        help=f"reactor -> group CSV (default: a {GROUPS_FILENAME} beside the data)",
     )
-    inputs.add_argument(
-        "--od-file",
-        type=Path,
-        help="CSV of OD readings. Overrides auto-discovery in <data-dir>/od_readings/.",
-    )
-    inputs.add_argument(
-        "--dosing-automation-file",
-        type=Path,
-        help="CSV of dosing automation events (DosingStarted / DosingStopped). "
-        "Overrides auto-discovery in <data-dir>/dosing_automation_events/.",
-    )
-    inputs.add_argument(
-        "--dosing-events-file",
-        type=Path,
-        help="CSV of dosing events, used for manual (UI) pump actions. Overrides "
-        "auto-discovery in <data-dir>/dosing_events/. Ignored with --ignore-manual-dosing.",
-    )
-    inputs.add_argument(
-        "--temperatures",
-        type=Path,
-        default=None,
-        help="CSV of temperature readings (columns: pioreactor_unit, temperature_c, "
-        "hours_since_experiment_created). Overrides auto-discovery in "
-        "<data-dir>/temperature_readings/.",
-    )
-    inputs.add_argument(
-        "--no-temperatures",
-        action="store_true",
-        help="Skip the temperature figures even if temperature readings are in the export.",
-    )
-    inputs.add_argument(
-        "--growth-rates",
-        type=Path,
-        default=None,
-        help="Plot an existing growth_rates.csv instead of recalculating it. The "
-        "calculation step and its plots are skipped.",
-    )
-
-    parser.add_argument(
+    io.add_argument(
         "--output-dir",
         type=Path,
         default=None,
-        help="Where to write the CSV and every plot folder (default: "
-        "YYMMDD_growth_analysis, YYMMDD being today's date, in the folder that "
-        "holds the export folder).",
+        metavar="DIR",
+        help="results folder (default: YYMMDD_growth_analysis beside the data)",
+    )
+    io.add_argument(
+        "--growth-rates",
+        type=Path,
+        default=None,
+        metavar="CSV",
+        help="redraw figures from an earlier growth_rates.csv, without fitting",
     )
 
-    calc = parser.add_argument_group("growth-rate calculation")
+    files = parser.add_argument_group(
+        "input files", "Each overrides auto-discovery of that one input in the export folder."
+    )
+    files.add_argument(
+        "--od-file",
+        type=Path,
+        metavar="CSV",
+        help="OD readings (od_readings/)",
+    )
+    files.add_argument(
+        "--dosing-automation-file",
+        type=Path,
+        metavar="CSV",
+        help="dilution start/stop events (dosing_automation_events/)",
+    )
+    files.add_argument(
+        "--dosing-events-file",
+        type=Path,
+        metavar="CSV",
+        help="manual UI pump actions (dosing_events/)",
+    )
+    files.add_argument(
+        "--temperatures",
+        type=Path,
+        default=None,
+        metavar="CSV",
+        help="temperature readings (temperature_readings/)",
+    )
+
+    reactors = parser.add_argument_group(
+        "reactor selection",
+        "Names are case-insensitive and a capital O is read as a zero (PO2 = P02).",
+    )
+    reactors.add_argument(
+        "--exclude-reactors",
+        nargs="+",
+        default=[],
+        metavar="UNIT",
+        help="ignore completely: not fitted, not in growth_rates.csv, in no plot",
+    )
+    reactors.add_argument(
+        "--omit-reactors",
+        nargs="+",
+        default=[],
+        metavar="UNIT",
+        help="fit them, but leave them out of the growth-rate figures",
+    )
+
+    calc = parser.add_argument_group("fitting")
     calc.add_argument(
         "--min-points",
         type=int,
         default=4,
-        help="Minimum OD readings required to fit a segment (default: 4).",
+        metavar="N",
+        help="minimum OD readings needed to fit a segment (default: 4)",
     )
     calc.add_argument(
         "--min-od",
         type=float,
         default=0.0,
-        help="Discard OD readings at or below this value before fitting. Useful to drop "
-        "near-zero blank readings whose logarithm is dominated by noise (default: 0.0).",
+        metavar="OD",
+        help="drop OD readings at or below this, e.g. blanks (default: 0.0)",
     )
     calc.add_argument(
         "--ignore-manual-dosing",
         action="store_true",
-        help="Do not treat manual (UI) pump actions from dosing_events/ as exclusion "
-        "windows. By default they ARE excluded, since they perturb OD just like "
-        "automated dilutions but are absent from dosing_automation_events/.",
+        help="keep OD readings taken during manual UI pump actions",
     )
 
-    plots = parser.add_argument_group("plots")
-    plots.add_argument(
+    cal = parser.add_argument_group(
+        "OD calibration",
+        "Linearly rescale each reactor's OD so its start and end match measured true ODs.",
+    )
+    cal.add_argument(
+        "--calibration",
+        type=Path,
+        default=None,
+        metavar="CSV",
+        help="reactor,od CSV with a low (start) and a high (end) OD per reactor "
+        "(default: a *calibration*.csv in od_readings/ or beside the data)",
+    )
+    cal.add_argument(
+        "--no-calibration",
+        action="store_true",
+        help="use the raw OD even if a calibration file is found",
+    )
+    cal.add_argument(
+        "--calibration-skip",
+        type=int,
+        default=10,
+        metavar="N",
+        help="first readings ignored when measuring the start OD (default: 10)",
+    )
+    cal.add_argument(
+        "--calibration-points",
+        type=int,
+        default=10,
+        metavar="N",
+        help="readings whose median is the measured start/end OD (default: 10)",
+    )
+
+    filters = parser.add_argument_group(
+        "plot filters", "These shape the figures only; growth_rates.csv keeps every segment."
+    )
+    filters.add_argument(
         "--min-r2",
         type=float,
         default=0.0,
-        help="Drop segments whose fit has a lower R^2 (default: 0.0, keep everything).",
+        metavar="R2",
+        help="drop segments whose fit has a lower R^2 (default: 0.0, keep all)",
     )
-    plots.add_argument(
+    filters.add_argument(
         "--between-dilutions-only",
         action="store_true",
-        help="Keep only segments bounded by dilutions on both sides, dropping the "
-        "start-of-experiment (lag phase) and end-of-experiment segments.",
+        help="drop the start-of-experiment (lag) and end-of-experiment segments",
     )
-    plots.add_argument(
-        "--omit-reactors",
-        nargs="+",
-        default=[],
-        metavar="UNIT",
-        help="Reactors to leave out of every plot and out of the group summary, "
-        "e.g. --omit-reactors P02. Matched case-insensitively, with a capital O "
-        "accepted for a zero.",
-    )
-    plots.add_argument(
-        "--stats",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Test the groups against each other and annotate the grouped plot "
-        "with the result (default: on).",
-    )
-    plots.add_argument(
-        "--stats-level",
-        choices=("reactor", "segment"),
-        default="reactor",
-        help="Unit of replication for the group comparison: 'reactor' (default) "
-        "uses one average per reactor; 'segment' pools every segment, which "
-        "overstates n because segments from one reactor are not independent.",
-    )
-    plots.add_argument(
-        "--average-line",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Draw each reactor's average growth rate as a dashed line on its "
-        "scatter plot (default: on; --no-average-line turns it off).",
-    )
-    plots.add_argument(
+
+    looks = parser.add_argument_group("plot appearance")
+    looks.add_argument(
         "--reference-line",
         type=float,
         nargs="+",
         metavar="MU",
-        help="Draw a dashed horizontal line at this growth rate (h^-1) on every "
-        "plot, e.g. a target or a published value. Repeatable: --reference-line 0.6 0.9",
+        help="dashed line at these growth rates (h^-1) on every plot",
+    )
+    looks.add_argument(
+        "--average-line",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="dashed line at each reactor's average growth rate (default: on)",
+    )
+    looks.add_argument(
+        "--hide-first-readings",
+        type=int,
+        nargs="?",
+        const=10,
+        default=0,
+        metavar="N",
+        help="leave each reactor's first N OD readings (default N: 10) out of the "
+        "OD figures; fits are unaffected",
+    )
+    looks.add_argument(
+        "--high-res-regression-plots",
+        action="store_true",
+        help=f"save the per-segment regression plots at {FIGURE_DPI} dpi too "
+        f"(default: {REGRESSION_DPI}; slower)",
+    )
+    looks.add_argument(
+        "--no-temperatures",
+        action="store_true",
+        help="skip the temperature figures even if the readings are there",
+    )
+
+    stats_args = parser.add_argument_group("group statistics")
+    stats_args.add_argument(
+        "--stats",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="compare the groups and annotate the grouped plot (default: on)",
+    )
+    stats_args.add_argument(
+        "--stats-level",
+        choices=("reactor", "segment"),
+        default="reactor",
+        help="replicate = each reactor's mean (default) or each segment",
     )
     return parser
 
@@ -1700,6 +2294,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    if args.calibration_skip < 0 or args.calibration_points < 1:
+        parser.error("--calibration-skip must be >= 0 and --calibration-points >= 1")
+    if args.hide_first_readings < 0:
+        parser.error("--hide-first-readings must be >= 0")
 
     if args.data_dir is not None and args.data_dir_positional is not None:
         parser.exit(2, "error: the data directory was given both positionally and as --data-dir.\n")
@@ -1729,14 +2327,31 @@ def main():
     out_dir = args.output_dir or default_output_dir(data_dir)
     print(f"Output folder:            {out_dir}\n")
 
+    excluded_found: set[str] = set()
+    od_trace = None  # only a fresh calculation has the OD readings to draw
     if args.growth_rates is not None:
         try:
             df = load_growth_rates(args.growth_rates)
         except (FileNotFoundError, ValueError) as exc:
             parser.exit(2, f"error: {exc}\n")
         print(f"Growth rates: {args.growth_rates}  ({len(df)} segments)")
+        if args.calibration is not None:
+            print("NOTE: --calibration is ignored with --growth-rates, which does not refit.")
+        df = drop_excluded(df, args.exclude_reactors, excluded_found)
+        if df.empty:
+            parser.exit(2, "error: no growth rates left after --exclude-reactors.\n")
     else:
-        df = prepare_growth_rates(calculate_growth_rates(args, parser, data_dir, out_dir))
+        if args.no_calibration:
+            args.calibration = None
+        elif args.calibration is None:
+            try:
+                args.calibration = find_calibration_file(data_dir, root)
+            except ValueError as exc:
+                parser.exit(2, f"error: {exc}\n")
+            if args.calibration is not None:
+                print(f"Calibration:              {args.calibration}  (found beside the data)")
+        rates, od_trace = calculate_growth_rates(args, parser, data_dir, out_dir, excluded_found)
+        df = prepare_growth_rates(rates)
 
     temps = None
     if not args.no_temperatures:
@@ -1755,6 +2370,14 @@ def main():
                 f"\nTemperatures:             {temp_path}  ({len(temps)} readings, "
                 f"{temps[UNIT_COL].nunique()} reactors)"
             )
+            temps = drop_excluded(temps, args.exclude_reactors, excluded_found)
+
+    if args.exclude_reactors:
+        if excluded_found:
+            print(f"\nExcluded from the whole analysis: {', '.join(sorted(excluded_found))}")
+        unknown = [u for u in args.exclude_reactors if _normalise_unit(u) not in excluded_found]
+        if unknown:
+            print(f"WARNING: --exclude-reactors: no such reactor in the data: {', '.join(unknown)}")
 
     groups_path = args.groups
     if groups_path is None:
@@ -1770,7 +2393,7 @@ def main():
         parser.exit(2, f"error: --groups: no such file: {groups_path}\n")
 
     print()
-    plot_growth_rates(args, parser, df, temps, out_dir, groups_path)
+    plot_growth_rates(args, parser, df, temps, out_dir, groups_path, od_trace)
     print(f"\nEverything written to {out_dir}")
 
 
